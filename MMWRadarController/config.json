@@ -1,0 +1,20 @@
+{
+  "uart0": "COM6",
+  "uart0-baudrate": 921600,
+  "uart1": "COM5",
+  "uart1-baudrate": 921600,
+  "total-bin-count": 40,
+  "monitor-frame-count": 10,
+  "read-timeout": 200,
+  "peak-threshold-min": 0.75,
+  "peak-threshold-max": 1.5,
+  "scan-interval": 1000,
+  "fake-signal": [
+    28358.0,
+    46360.0,
+    53836.0,
+    42647.0,
+    22593.0,
+    6436.0
+  ]
+}
