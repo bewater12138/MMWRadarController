@@ -13,6 +13,10 @@
 #include <queue>
 #include <mutex>
 #include <optional>
+#include <functional>
+#include <concepts>
+#include <atomic>
+#include <future>
 
 template<class Container>
 std::string ToString(const Container& c)
@@ -35,15 +39,77 @@ using namespace std::literals;
 using namespace std::chrono_literals;
 using byte = uint8_t;
 
-constexpr byte SYNC0 = 0X55;
-constexpr byte SYNC1 = 0XAA;
-constexpr byte CMD_SET_OFFSET = 0x01;
-constexpr byte RSP_ACK = 0x81;
-constexpr size_t SendBinCount = 10;
-constexpr size_t SendCount = SendBinCount + 1;
-constexpr size_t CHANNEL_BYTES = SendCount * 4;
-constexpr size_t CHANNEL_COUNT = 8;
-constexpr size_t FRAME_LENGTH = CHANNEL_COUNT * CHANNEL_BYTES;
+template<class It>
+concept byte_Iterator = 
+    std::is_same_v<std::decay_t<decltype(*It())>, byte> &&
+    requires(It beg, It end)
+{
+    std::vector<byte>(beg, end);
+};
+
+/*
+控制帧协议：
+    SYNC0           : 1
+    SYNC1           : 1
+    <command>       : 1
+    <payload_len>   : 2
+    <payload>       : payload_len
+    <crc>           : 1
+*/
+#define CTRL_SYNC0 0X55
+#define CTRL_SYNC1 0Xaa
+#define CTRL_CMD_SET_OFFSET 0X01    //payload为新窗口偏移
+#define CTRL_CMD_FULL_SCAN 0X02     //payload为空
+#define MINIMAL_CTRL_FRAME_LEN 6
+#define MAX_CTRL_PAYLOAD_LEN 64
+
+template<byte_Iterator It>
+std::vector<byte> MakeCtrlFrame(byte cmd, It payload_beg, It payload_end)
+{
+    std::vector<byte> frame( 6 + (payload_end - payload_beg) );
+    frame[0] = CTRL_SYNC0;
+    frame[1] = CTRL_SYNC1;
+    frame[2] = cmd;
+    reinterpret_cast<uint16_t&>(frame[3]) = (uint16_t)(payload_end - payload_beg);
+    frame.resize(5);
+    frame.insert(frame.end(), payload_beg, payload_end);
+    byte crc = std::accumulate(frame.begin(), frame.end(), 0);
+    frame.push_back(crc);
+    return frame;
+}
+
+#define SEND_BIN_COUNT 10
+#define TOTAL_BIN_COUNT 40
+#define CHANNEL_COUNT 8
+
+#define FRAME_TOTAL_CRC_SIZE 4
+#define FRAME_HEAD_SIZE 12
+#define FRAMETYPE_OFFSET_FFTDATA 1
+#define FRAMETYPE_FULLSCAN_FFTDATA 2
+#define FRAMETYPE_SETOFFSET_ACK 3
+#define FRAMETYPE_INFO 4
+/*
+数据帧协议:
+    <head>              : 12
+        0x55
+        0xaa
+        0x00
+        0xff
+        <type>          : 2
+        <arg>           : 2
+        <payload_len>   : 2
+        <head_crc>      : 2
+    <body>              : payload_len
+    <crc>               : 4
+        crc(head+body)  : 1
+        crc + 1         : 1
+        crc + 2         : 1
+        crc + 3         : 1
+*/
+
+#define FULLSCAN_COUNT_PER_CMD  5
+#define MINAMAL_FULLSCAN_COUNT_PER_CMD  3
+
 nlohmann::json g_Config;
 
 struct Complex16
@@ -54,118 +120,168 @@ struct Complex16
 
 struct Frame
 {
-#pragma warning(disable: 26495)
-    template<class It>
-        requires requires(It beg, It end)
-    {
-        std::vector<byte>(beg, end);
-    }
-    Frame(It beg, It end)
-        :RawData(beg, end)
-    {
-        Offset = reinterpret_cast<uint16_t&>(RawData[2]);
-        for (size_t ch = 0; ch < CHANNEL_COUNT; ch++)
-        {
-            void* channel_ptr = &RawData[ch * CHANNEL_BYTES + 4];
-            memcpy_s(Complex16Datas[ch].data(), SendBinCount * 4, channel_ptr, SendBinCount * 4);
-        }
+    Frame() = default;
 
-        double mag[SendBinCount][CHANNEL_COUNT];
-        for (size_t ch = 0; ch < CHANNEL_COUNT; ch++)
+    template<byte_Iterator It>
+    Frame(uint16_t type, uint16_t arg, It payload_beg, It payload_end)
+        :Head{
+            .Type = type,
+            .Arg = arg,
+        }, Payload(payload_beg, payload_end)
+    {
+        
+    }
+
+    struct
+    {
+        byte Sync[4];
+        uint16_t Type;
+        uint16_t Arg;
+        uint16_t PayloadLen;
+        uint16_t HeadCRC;
+    }Head;
+    std::vector<byte> Payload{};
+};
+
+struct MonitorFrame
+{
+    MonitorFrame() = default;
+    MonitorFrame(const Frame& frame)
+    {
+        assert(frame.Head.Type == FRAMETYPE_OFFSET_FFTDATA);
+        Offset = frame.Head.Arg;
+        memcpy_s(Data, sizeof(Data), frame.Payload.data(), frame.Payload.size());
+        for (size_t bin = 0; bin < SEND_BIN_COUNT; bin++)
         {
-            for (size_t bin = 0; bin < SendBinCount; bin++)
+            EnergyCurve[bin] = 0.0;
+            for (size_t ch = 0; ch < CHANNEL_COUNT; ch++)
             {
-                mag[bin][ch] = std::sqrt(
-                    Complex16Datas[ch][bin].Imag * Complex16Datas[ch][bin].Imag +
-                    Complex16Datas[ch][bin].Real * Complex16Datas[ch][bin].Real
+                EnergyCurve[bin] += std::sqrt(
+                    Data[ch][bin].Imag * Data[ch][bin].Imag +
+                    Data[ch][bin].Real * Data[ch][bin].Real
                 );
             }
         }
+    }
 
-        for (size_t bin = 0; bin < SendBinCount; bin++)
-        {
-            EnergyCurve[bin] = std::accumulate(&mag[bin][0], &mag[bin][CHANNEL_COUNT], 0.0);
-        }
+    uint16_t Offset;
+    Complex16 Data[CHANNEL_COUNT][SEND_BIN_COUNT];
+    double EnergyCurve[SEND_BIN_COUNT];
+};
 
-        //修复伪高峰
-        auto& fake_signal = g_Config["fake-signal"];
-        for (size_t i = 0; i < SendBinCount; i++)
+struct InfoFrame
+{
+    InfoFrame() = default;
+    InfoFrame(const Frame& frame)
+    {
+        assert(frame.Head.Type == FRAMETYPE_INFO);
+        Text.resize(frame.Payload.size());
+        memcpy_s(Text.data(), Text.size(), frame.Payload.data(), frame.Payload.size());
+    }
+
+    std::string Text;
+};
+
+struct ScanFrame
+{
+    ScanFrame() = default;
+    ScanFrame(const Frame& frame)
+    {
+        assert(frame.Head.Type == FRAMETYPE_FULLSCAN_FFTDATA);
+        memcpy_s(Data, sizeof(Data), frame.Payload.data(), frame.Payload.size());
+        for (size_t bin = 0; bin < TOTAL_BIN_COUNT; bin++)
         {
-            if (i + Offset < fake_signal.size())
+            EnergyCurve[bin] = 0.0;
+            for (size_t ch = 0; ch < CHANNEL_COUNT; ch++)
             {
-                EnergyCurve[i] -= fake_signal[i + Offset];
-                EnergyCurve[i] = std::max(0.0, EnergyCurve[i]);
+                EnergyCurve[bin] += std::sqrt(
+                    Data[ch][bin].Imag * Data[ch][bin].Imag +
+                    Data[ch][bin].Real * Data[ch][bin].Real
+                );
             }
         }
     }
-    Frame(const Frame&) = default;
-    Frame(Frame&&) = default;
-	Frame& operator=(const Frame&) = default;
-	Frame& operator=(Frame&&) = default;
 
-    uint16_t Offset;
-	std::vector<byte> RawData;
-    std::array<
-        std::array<Complex16, SendBinCount>,
-        CHANNEL_COUNT
-    > Complex16Datas;
-    std::array<double, SendBinCount> EnergyCurve;
+    Complex16 Data[CHANNEL_COUNT][TOTAL_BIN_COUNT];
+    double EnergyCurve[TOTAL_BIN_COUNT];
 };
 
-byte CalCRC(uint32_t cmd, const std::vector<byte>& payloads)
-{
-    byte payload_sum = std::accumulate(payloads.begin(), payloads.end(), 0);
-    byte crc = (byte)(cmd + payloads.size() + payload_sum) & 0xff;
-    return crc;
-}
-
-class Uart0Reader
+class UartReader
 {
 public:
-    Uart0Reader(std::string_view port_name, uint32_t baudrate)
-		:_Uart(port_name.data(), baudrate, serial::Timeout::simpleTimeout(1000))
+    using LockGuard = std::lock_guard<std::mutex>;
+
+    UartReader(const std::string& port_name, uint32_t baudrate)
     {
-        if (_Uart.isOpen())
+        try
+        {
+            _Uart.emplace(port_name, baudrate);
+            _IsOpen = _Uart->isOpen();
+        }
+        catch (const serial::PortNotOpenedException& expt)
+        {
+            _ErrorMessage = expt.what();
+        }
+        catch (const serial::IOException& expt)
+        {
+            _ErrorMessage = expt.what();
+        }
+        catch (const std::invalid_argument& expt)
+        {
+            _ErrorMessage = expt.what();
+        }
+        catch (const std::exception& unknow_expt)
+        {
+            _ErrorMessage = unknow_expt.what();
+        }
+
+        if (IsOpen())
         {
             _ReaderThread = std::jthread([this](std::stop_token stoken) {
                 _StopToken = stoken;
                 _Run();
                 });
         }
-	}
-
-    ~Uart0Reader()
-    {
-        if (_ReaderThread.joinable())
-        {
-            _ReaderThread.request_stop();
-			_ReaderThread.join();
-        }
-        if(_Uart.isOpen())
-            _Uart.close();
     }
 
-    bool IsOpen()
+    ~UartReader()
     {
-        return _Uart.isOpen();
+        if (_IsOpen)
+        {
+            if (_ReaderThread.joinable())
+            {
+                _ReaderThread.request_stop();
+                _ReaderThread.join();
+            }
+        }
+    }
+
+    bool IsOpen()const
+    {
+        return _IsOpen;
     }
 
     void RequestStop()
     {
-		_ReaderThread.request_stop();
+        _ReaderThread.request_stop();
+    }
+
+    std::optional<std::string> GetErrorMessage()const
+    {
+        return _ErrorMessage;
     }
 
     size_t FrameCount()
     {
-        auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
-		return _Frames.size();
+        LockGuard lg(_FrameQueueMutex);
+        return _Frames.size();
     }
 
     Frame PopFrame()
     {
-        auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
-		Frame frame = _Frames.front();
-		_Frames.pop();
+        LockGuard lg(_FrameQueueMutex);
+        Frame frame = _Frames.front();
+        _Frames.pop();
         return frame;
     }
 
@@ -173,7 +289,7 @@ public:
     {
         std::vector<Frame> frames;
         frames.reserve(count);
-        auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
+        LockGuard lg(_FrameQueueMutex);
         assert(_Frames.size() >= count);
         for (size_t i = 0; i < count; i++)
         {
@@ -185,7 +301,7 @@ public:
 
     std::vector<Frame> PopAllFrames()
     {
-        auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
+        LockGuard lg(_FrameQueueMutex);
         std::vector<Frame> frames;
         while (!_Frames.empty())
         {
@@ -193,209 +309,316 @@ public:
             _Frames.pop();
         }
         return frames;
-	}
+    }
 
     void ClearFrames()
     {
-        auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
+        LockGuard lg(_FrameQueueMutex);
         while (!_Frames.empty())
         {
             _Frames.pop();
         }
     }
 
-private:
-    void _Run()
-    {
-		constexpr size_t buffer_size = 1024;
-        static std::vector<byte> buffer(buffer_size);
-        while (!_StopToken.stop_requested())
-        {
-            auto read_count = _Uart.read(buffer.data(),std::min(_Uart.available(), buffer_size));
-			_RawData.insert(_RawData.end(), buffer.begin(), buffer.begin() + read_count);
-            
-			//寻找数据帧起始位置
-            while(_RawData.size() >= FRAME_LENGTH)
-            {
-                auto start_pos = _FindFrameStart();
-                if (start_pos.has_value())
-                {
-                    auto lg = std::lock_guard<std::mutex>(_FrameQueueMutex);
-                    _RawData.erase(_RawData.begin(), _RawData.begin() + start_pos.value());
-                    _Frames.emplace(Frame(_RawData.begin(), _RawData.begin() + FRAME_LENGTH));
-                    _RawData.erase(_RawData.begin(), _RawData.begin() + FRAME_LENGTH);
+protected:
+    std::optional<std::string> _ErrorMessage;
 
-					//防止队列无限增长
-                    if(_Frames.size() > 100)
-                    {
-                        _Frames.pop();
-					}
-                }
-				else if(_RawData.size() >= FRAME_LENGTH) //无法找到帧起始位置，丢弃无效部分数据
-                {
-                    _RawData.erase(_RawData.begin(), _RawData.end() - FRAME_LENGTH);
-                    break;
-                }
-            }
-        }
+    void _IgnoreBytes(size_t count)
+    {
+        _RawData.erase(_RawData.begin(), _RawData.begin() + count);
     }
 
-    std::optional<size_t> _FindFrameStart()
-    {
-        for (size_t i = 0; i <= _RawData.size() - FRAME_LENGTH; i++)
-        {
-            bool ok = true;
-            for (size_t ch = 0; ch < CHANNEL_COUNT; ch++)
-            {
-				size_t pos = i + ch * CHANNEL_BYTES;
-                if (not (_RawData[pos] == 0x0a && _RawData[pos + 1] == 0x00))
-                {
-                    ok = false;
-					break;
-                }
-
-                if (ch == 0)
-                {
-                    
-                }
-                else
-                {
-                    if (not (_RawData[pos + 2] == ch && _RawData[pos + 3] == 0x00))
-                    {
-                        ok = false;
-						break;
-                    }
-                }
-            }
-
-            if (ok)
-            {
-                return i;
-            }
-        }
-
-		std::cerr << "无法对数据流进行同步" << std::endl;
-		return std::nullopt;
-    }
-
-private:
-	std::jthread _ReaderThread;
-	std::stop_token _StopToken;
-	serial::Serial _Uart;
-	std::deque<byte> _RawData;
-	std::queue<Frame> _Frames;
-	std::mutex _FrameQueueMutex;
-};
-
-class Uart1Controller
-{
-public:
-    Uart1Controller(std::string_view port_name, uint32_t baudrate)
-        :_Uart(port_name.data(), baudrate, serial::Timeout::simpleTimeout(200))
+    virtual void _OnUpdate()
     {
 
-    }
-
-    bool IsOpen()
-    {
-        return _Uart.isOpen();
-    }
-
-    bool CmdSetOffset(uint16_t offset)
-    {
-        if (_Offset == offset)return true;
-
-        //最多重试两次
-        for (size_t i = 0; i < 3; i++)
-        {
-            _Uart.read(_Uart.available());
-            auto frame = BuildSetOffsetFrame(offset);
-            _Uart.write(frame);
-            _Uart.flushOutput();
-            auto start_time = std::chrono::high_resolution_clock::now();
-            auto deadline = start_time + 200ms;
-            while (std::chrono::high_resolution_clock::now() < deadline)
-            {
-                if (auto ack = _TryParseACKFrame())
-                {
-                    if (ack.value() == 0)
-                    {
-                        _Offset = offset;
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    std::vector<byte> BuildSetOffsetFrame(uint16_t offset)
-    {
-        return {
-            SYNC0,
-            SYNC1,
-            CMD_SET_OFFSET,
-            0x02,
-            (byte)offset,
-            0,
-            CalCRC(CMD_SET_OFFSET, {(byte)offset, 0})
-        };
-    }
-
-    uint16_t Offset()
-    {
-        return _Offset;
     }
 
 private:
-    std::optional<byte> _TryParseACKFrame()
+    bool _IsOpen = false;
+
+    std::optional<Frame> _TempFrame;
+
+    void _TryParseFrame()
     {
-        //ACK 帧: 55 AA 81 01 <status> <crc>
-        constexpr size_t ack_frame_length = 6;
+        BEGIN_PARSE:
 
-        //先从串口读出数据
-        static byte recvbuf[64];
-        auto count = _Uart.read(recvbuf, std::min(_Uart.available(), sizeof(recvbuf)));
-        _RecvRawData.insert(_RecvRawData.end(), recvbuf + 0, recvbuf + count);
-
-        while (_RecvRawData.size() >= ack_frame_length)
+        //检查头部
+        if (!_TempFrame.has_value())
         {
-            if (_RecvRawData.size() < ack_frame_length)continue;
+            if (_RawData.size() < FRAME_HEAD_SIZE)return;
 
-            if (_RecvRawData[0] == 0x55 &&
-                _RecvRawData[1] == 0xaa &&
-                _RecvRawData[2] == 0x81 &&
-                _RecvRawData[3] == 0x01)
+            if (_RawData[0] == 0x55 &&
+                _RawData[1] == 0xaa &&
+                _RawData[2] == 0x00 &&
+                _RawData[3] == 0xff)
             {
-                auto cmd = _RecvRawData[2];
-                auto length = _RecvRawData[3];
-                auto payload = _RecvRawData[4];
-                auto crc = (cmd + length + payload);
-                if (crc == _RecvRawData[5]) //成功读取到确认帧
+                std::vector<byte> head_buf;
+                head_buf.clear();
+                head_buf.insert(head_buf.begin(), _RawData.begin(), _RawData.begin() + FRAME_HEAD_SIZE - sizeof(uint16_t));
+                uint16_t* p = reinterpret_cast<uint16_t*>(head_buf.data());
+                uint16_t crc = 0;
+                for (size_t i = 0; i < (FRAME_HEAD_SIZE - sizeof(uint16_t))/2; i++)
                 {
-                    _IgnoreBytes(ack_frame_length);
-                    return payload;
+                    crc += p[i];
+                }
+
+                union {
+                    struct 
+                    {
+                        byte CRC_LowByte;
+                        byte CRC_HighByte;
+                    };
+                    uint16_t CRC;
+                };
+                CRC_LowByte = _RawData[FRAME_HEAD_SIZE - sizeof(uint16_t)];
+                CRC_HighByte = _RawData[FRAME_HEAD_SIZE - sizeof(uint16_t) + 1];
+                if (CRC == crc)
+                {
+                    _TempFrame.emplace();
+                    std::vector<byte> head(_RawData.begin(), _RawData.begin() + FRAME_HEAD_SIZE);
+                    memcpy_s(&_TempFrame->Head, FRAME_HEAD_SIZE, head.data(), FRAME_HEAD_SIZE);
+                    _IgnoreBytes(FRAME_HEAD_SIZE);
                 }
                 else
                 {
                     _IgnoreBytes(4);
                 }
             }
-            _IgnoreBytes(1);
+            else
+            {
+                _IgnoreBytes(1);
+            }
         }
 
-        return std::nullopt;
+        //如果已经读取了完整的头部，则等待接收足够的负载数据
+        if (_TempFrame.has_value())
+        {
+            if (_RawData.size() < _TempFrame->Head.PayloadLen + FRAME_TOTAL_CRC_SIZE)
+            {
+                return;
+            }
+
+            auto& payload = _TempFrame->Payload;
+            size_t payload_size = _TempFrame->Head.PayloadLen;
+            payload.insert(payload.begin(), _RawData.begin(), _RawData.begin() + payload_size);
+            _IgnoreBytes(payload_size);
+
+            //检查crc
+            byte crc = std::accumulate((byte*)&_TempFrame->Head, (byte*)&_TempFrame->Head + FRAME_HEAD_SIZE, 0);
+            crc = std::accumulate(_TempFrame->Payload.begin(), _TempFrame->Payload.end(), crc);
+            if (_RawData[0] == crc &&
+                _RawData[1] == crc + 1 &&
+                _RawData[2] == crc + 2 &&
+                _RawData[3] == crc + 3)
+            {
+                LockGuard lg(_FrameQueueMutex);
+                _Frames.emplace(std::move(_TempFrame.value()));
+            }
+
+            //重置接收状态
+            _TempFrame.reset();
+            _IgnoreBytes(FRAME_TOTAL_CRC_SIZE);
+        }
+
+        goto BEGIN_PARSE;
     }
 
-    void _IgnoreBytes(size_t count)
+    void _Run()
     {
-        _RecvRawData.erase(_RecvRawData.begin(), _RecvRawData.begin() + count);
+        constexpr size_t buffer_size = 1024;
+        std::array<byte, buffer_size> buffer;
+        buffer.fill(0);
+
+        while (!_StopToken.stop_requested())
+        {
+            _UartMutex.lock();
+            if (_Uart->available() > 0)
+            {
+                auto count = _Uart->read(buffer.data(), std::min(buffer.size(), _Uart->available()));
+                _RawData.insert(_RawData.end(), buffer.begin(), buffer.begin() + count);
+            }
+            else
+            {
+                std::this_thread::sleep_for(10us);
+            }
+            _UartMutex.unlock();
+            _TryParseFrame();
+            _OnUpdate();
+
+            //防止挤压过多帧
+            LockGuard lg(_FrameQueueMutex);
+            while(_Frames.size() > 20)
+            {
+                _Frames.pop();
+            }
+        }
+    }
+
+protected:
+    std::mutex _UartMutex;
+    std::optional<serial::Serial> _Uart;
+    std::jthread _ReaderThread;
+    std::stop_token _StopToken;
+    std::deque<byte> _RawData;
+    std::queue<Frame> _Frames;
+    std::mutex _FrameQueueMutex;
+};
+
+class Uart0Monitor:public UartReader
+{
+public:
+    Uart0Monitor(const std::string& port_name, uint32_t baudrate)
+        :UartReader(port_name, baudrate)
+    {
+
+    }
+
+    MonitorFrame PopMonitorFrame()
+    {
+        return MonitorFrame(PopFrame());
+    }
+};
+
+class Uart1Controller :public UartReader
+{
+public:
+    using LockGuard = std::lock_guard<std::mutex>;
+    using AfterScanCallback = std::function<void(const std::vector<ScanFrame>&)>;
+
+    Uart1Controller(const std::string& port_name, uint32_t baudrate)
+        :UartReader(port_name, baudrate)
+    {
+
+    }
+
+    bool SetOffset(uint16_t offset)
+    {
+        if (_SetOffsetMutex.try_lock())
+        {
+            _NeedSetOffsetACK = true;
+            for (size_t i = 0; i < 3; i++)
+            {
+                auto frame = MakeCtrlFrame((byte)CTRL_CMD_SET_OFFSET, (byte*)&offset, (byte*)&offset + 2);
+                _UartMutex.lock();
+                _Uart->write(frame);
+                _Uart->flushOutput();
+                _UartMutex.unlock();
+
+                auto deadline = std::chrono::steady_clock::now() + 100ms;
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    if (!_NeedSetOffsetACK) //已经接收到了ack
+                    {
+                        _SetOffsetMutex.unlock();
+                        return true;
+                    }
+                }
+            }
+            _SetOffsetMutex.unlock();
+            return false;
+        }
+        return false;
+    }
+
+    void RequestFullScan(AfterScanCallback after_scan, std::chrono::steady_clock::duration retry_time)
+    {
+        _ScanMutex.lock();
+        _Scanning = true;
+        _NeedScanFrameCount = MINAMAL_FULLSCAN_COUNT_PER_CMD;
+        //_NeedScanFrameCount = 1;
+        _BeginScanTime = std::chrono::steady_clock::now();
+        _RetryTime = retry_time;
+        _ScanFrames.clear();
+        _AfterScan = after_scan;
+        _ScanMutex.unlock();
+
+        _SendFullScanFrame();
+    }
+
+    uint16_t GetOffset()const
+    {
+        return _Offset;
+    }
+
+    bool Scanning()
+    {
+        LockGuard lg(_ScanMutex);
+        return _Scanning;
+    }
+
+protected:
+    void _OnUpdate()override
+    {
+        while (FrameCount() > 0)
+        {
+            Frame frame = PopFrame();
+            if (frame.Head.Type == FRAMETYPE_INFO)
+            {
+                InfoFrame info(frame);
+                if (!info.Text.ends_with('\n'))
+                {
+                    info.Text.append(1, '\n');
+                }
+                std::cout << std::format("[uart1 info]:{}", info.Text);
+            }
+            else if (frame.Head.Type == FRAMETYPE_FULLSCAN_FFTDATA)
+            {
+                LockGuard lg(_ScanMutex);
+                if (!_Scanning)continue;
+
+                _ScanFrames.emplace_back(ScanFrame(frame));
+
+                std::cout << "接收到了全局帧，已接收" << _ScanFrames.size() << "帧\n";
+
+                if (_ScanFrames.size() == _NeedScanFrameCount)  //扫描了足够的帧数
+                {
+                    if(_AfterScan)
+                        _AfterScan(_ScanFrames);
+                    _Scanning = false;
+                    _ScanFrames.clear();
+                }
+            }
+            else if (frame.Head.Type == FRAMETYPE_SETOFFSET_ACK)
+            {
+                _NeedSetOffsetACK = false;
+            }
+            else
+            {
+                std::cerr << "uart1接收到预期外的数据帧类型:" << frame.Head.Type << std::endl;
+                assert(false);
+            }
+        }
+
+        //检测全局扫描是否超时，如果超时，则重试
+        LockGuard lg(_ScanMutex);
+        if (_Scanning && _BeginScanTime + _RetryTime < std::chrono::steady_clock::now())
+        {
+            _BeginScanTime = std::chrono::steady_clock::now();
+            _ScanFrames.clear();
+            _SendFullScanFrame();
+        }
+    }
+
+    void _SendFullScanFrame()
+    {
+        auto frame = MakeCtrlFrame((byte)CTRL_CMD_FULL_SCAN, (byte*)nullptr, (byte*)nullptr);
+        LockGuard lg(_UartMutex);
+        //_Uart->read(_Uart->available());
+        _Uart->write(frame);
+        _Uart->flushOutput();
     }
 
 private:
-    serial::Serial _Uart;
-    std::deque<byte> _RecvRawData;
     uint16_t _Offset = 5;
+    std::mutex _ScanMutex;
+    std::mutex _SetOffsetMutex;
+    bool _Scanning = false;
+    int _NeedScanFrameCount = 0;
+    std::chrono::steady_clock::time_point _BeginScanTime{};
+    std::chrono::steady_clock::duration _RetryTime{};
+    AfterScanCallback _AfterScan;
+    std::vector<ScanFrame> _ScanFrames;
+    std::atomic_bool _NeedSetOffsetACK = false;
 };
 
 std::mutex g_UserOffsetMutex;
@@ -404,160 +627,159 @@ uint16_t g_UserOffset = 5;
 bool g_ShowAllBins = false;
 
 std::mutex g_CurveMutex;
-std::array<double, SendBinCount> g_CurveX;
-std::array<double, SendBinCount> g_CurveY;
+std::array<double, TOTAL_BIN_COUNT> g_MonitorCurveX;
+std::array<double, TOTAL_BIN_COUNT> g_MonitorCurveY;
 std::mutex g_GlobalCurveMutex;
-std::vector<double> g_GlobalCurveY;
-void DataThread(std::stop_token stoken, Uart0Reader& u0, Uart1Controller& u1)
+std::vector<double> g_GlobalCurveY(TOTAL_BIN_COUNT);
+void DataThread(std::stop_token stoken, Uart0Monitor& u0, Uart1Controller& u1)
 {
     auto monitor_frame_count=                               g_Config["monitor-frame-count"].get<size_t>();
     auto read_timeout       =   std::chrono::milliseconds(  g_Config["read-timeout"].get<size_t>());
-    size_t total_bin_count  =                               g_Config["total-bin-count"].get<size_t>();
+    //size_t total_bin_count  =                               g_Config["total-bin-count"].get<size_t>();
     auto peak_threshold_min =                               g_Config["peak-threshold-min"].get<double>();
     auto peak_threshold_max =                               g_Config["peak-threshold-max"].get<double>();
     auto scan_interval      =   std::chrono::milliseconds(  g_Config["scan-interval"].get<int>());
 
-    u1.CmdSetOffset(5);
-    uint16_t recvd_offset = u1.Offset();
-    std::vector<Frame> recv_frames;
+    u1.SetOffset(5);
+    std::vector<MonitorFrame> recv_frames;
+    for (size_t i = 0; i < TOTAL_BIN_COUNT; i++)
+    {
+        g_MonitorCurveX[i] = 5.0 * i;
+    }
     auto last_read_time = std::chrono::high_resolution_clock::now();
     auto last_scan_time = std::chrono::high_resolution_clock::now();
 
     std::optional<size_t> last_peak_offset;
     std::optional<double> last_peak_value;
 
-    auto set_offset_by_peak = [&](size_t peak_offset, size_t old_offset) {
-        uint16_t new_offset = (uint16_t)(peak_offset - std::min(peak_offset, SendBinCount / 2));
-        new_offset = std::min((uint16_t)(total_bin_count - SendBinCount), new_offset);
+    auto set_offset_by_peak = [&](size_t peak_offset, size_t old_offset) -> bool {
+        uint16_t new_offset = (uint16_t)(peak_offset - std::min(peak_offset, (size_t)SEND_BIN_COUNT / 2));
+        new_offset = std::min((uint16_t)(TOTAL_BIN_COUNT - SEND_BIN_COUNT), new_offset);
         if (new_offset != old_offset)
         {
-            bool success = u1.CmdSetOffset(new_offset);
+            bool success = u1.SetOffset(new_offset);
+            return success;
         }
+        return false;
         };
 
-    auto full_scan = [&]()->bool {
-        std::cout << "正在执行全量扫描...\n";
-
-        std::vector<double> curve(total_bin_count);
-
-        //扫描所有bin
-        uint16_t cur_offset = 0;
-        for (; cur_offset + SendBinCount <= total_bin_count; cur_offset+=SendBinCount)
-        {
-            u0.ClearFrames();
-            if (!u1.CmdSetOffset(cur_offset))
-            {
-                std::cout << "全量扫描失败\n";
-                return false;
-            }
-
-            for (size_t i = 0; i < monitor_frame_count; i++)
-            {
-                auto start_time = std::chrono::high_resolution_clock::now();
-                while (start_time + read_timeout > std::chrono::high_resolution_clock::now())
+    //收集全局扫描数据
+    std::atomic_bool fullscan_over = false; //标识是否完成了一次全局扫描
+    auto process_fullscan_data = [&](const std::vector<ScanFrame>& data){
+        //在uart1读线程中回调
+        assert(!data.empty());
+        auto task = std::async(
+            [&](){
+                auto& fake_peak = g_Config["fake-signal"];
+                g_GlobalCurveMutex.lock();
+                for (size_t bin = 0; bin < TOTAL_BIN_COUNT; bin++)
                 {
-                    if (u0.FrameCount() == 0)continue;
-                    Frame frame = u0.PopFrame();
-                    if (frame.Offset == cur_offset)
+                    g_GlobalCurveY[bin] = 0.0;
+                    for (auto& frame : data)
                     {
-                        for (size_t j = 0; j < SendBinCount; j++)
-                        {
-                            curve[cur_offset + j] += frame.EnergyCurve[j];
-                        }
-                        break;
+                        g_GlobalCurveY[bin] += frame.EnergyCurve[bin];
+                    }
+                    g_GlobalCurveY[bin] /= data.size();
+
+                    //手动去除假信号
+                    if (bin < fake_peak.size())
+                    {
+                        g_GlobalCurveY[bin] = std::max(
+                            g_GlobalCurveY[bin] - fake_peak[bin].get<double>(),
+                            0.0
+                        );
                     }
                 }
+                fullscan_over = true;
+
+                std::cout << "完成全局扫描\n";
+                auto peak_offset = std::max_element(g_GlobalCurveY.begin(), g_GlobalCurveY.end()) - g_GlobalCurveY.begin();
+                auto peak_value = g_GlobalCurveY[peak_offset];
+                set_offset_by_peak(peak_offset, u1.GetOffset());
+                g_GlobalCurveMutex.unlock();
             }
-            for (size_t j = 0; j < SendBinCount; j++)
-            {
-                curve[cur_offset + j] /= (double)monitor_frame_count;
-            }
-        }
+        );
+    };
 
-        g_GlobalCurveMutex.lock();
-        g_GlobalCurveY = curve;
-        g_GlobalCurveMutex.unlock();
-
-        //找出峰值
-
-        auto peak_idx = std::max_element(curve.begin(), curve.end()) - curve.begin();
-        last_peak_offset = peak_idx;
-        last_peak_value = curve[peak_idx];
-        set_offset_by_peak(peak_idx, cur_offset);
-
-        std::cout << std::format("全量扫描结束, peak_offset = {}\n", peak_idx);
-        return true;
-        };
-
-    //启动后进行首次全量扫描
-    while (!full_scan())
+    //启动后进行首次全局扫描
+    std::cout << "正在等待首次全局扫描...\n";
+    u1.RequestFullScan(process_fullscan_data, 1000ms);
+    while (!stoken.stop_requested() && !fullscan_over)
     {
-        std::cerr << "重试全量扫描\n";
+        std::this_thread::sleep_for(10ms);
     }
 
+    //进入监测周期
     while (!stoken.stop_requested())
     {
-        uint16_t offset = u1.Offset();
-        if (recvd_offset != offset)
-        {
-            recv_frames.clear();
-        }
-
+        //读取监测数据
         while (recv_frames.size() < monitor_frame_count
-            && std::chrono::high_resolution_clock::now() < last_read_time + read_timeout)
+            && std::chrono::steady_clock::now() < last_read_time + read_timeout)
         {
             if (u0.FrameCount())
             {
-                auto frame = u0.PopFrame();
-                if (frame.Offset != offset)continue;
-
-                recv_frames.emplace_back(frame);
-                recvd_offset = frame.Offset;
+                auto frame = u0.PopMonitorFrame();
+                if (frame.Offset < TOTAL_BIN_COUNT - SEND_BIN_COUNT)
+                {
+                    recv_frames.emplace_back(std::move(frame));
+                }
+                else
+                {
+                    std::cerr << std::format("收到异常偏移的帧:Offset={}\n", frame.Offset);
+                }
             }
         }
-
+        last_read_time = std::chrono::high_resolution_clock::now();
         if (recv_frames.empty())
         {
             std::cerr << "读取帧超时\n";
-            last_read_time = std::chrono::high_resolution_clock::now();
             continue;
         }
 
-        //读取了足够的帧数或者到达指定时间，则开始填充折线图数据
+        //根据监测数据填充折线图
         g_CurveMutex.lock();
-        g_CurveY.fill(0.0);
+        g_MonitorCurveY.fill(0.0);
+        std::array<int, TOTAL_BIN_COUNT> frame_count_per_bin;
+        frame_count_per_bin.fill(0);
         for (auto& f : recv_frames)
         {
-            for (size_t i = 0; i < SendBinCount; i++)
+            for (size_t i = 0; i < SEND_BIN_COUNT; i++)
             {
-                g_CurveY[i] += f.EnergyCurve[i];
+                g_MonitorCurveY[f.Offset + i] += f.EnergyCurve[i];
+                frame_count_per_bin[f.Offset + i]++;
             }
         }
-        for (auto& e : g_CurveY)
+        auto& fake_peak = g_Config["fake-signal"];
+        for (size_t i = 0; i < TOTAL_BIN_COUNT; i++)
         {
-            e /= (double)recv_frames.size();
-        }
-        for (size_t i = 0; i < SendBinCount; i++)
-        {
-            g_CurveX[i] = offset * 5.0 + i * 5.0;
+            if (frame_count_per_bin[i] == 0)continue;
+            g_MonitorCurveY[i] /= frame_count_per_bin[i];
+
+            //手动去除伪高峰
+            if (i < fake_peak.size())
+            {
+                g_MonitorCurveY[i] = std::max(
+                    g_MonitorCurveY[i] - fake_peak[i].get<double>(),
+                    0.0
+                );
+            }
         }
         g_CurveMutex.unlock();
-
         recv_frames.clear();
-        last_read_time = std::chrono::high_resolution_clock::now();
 
         //计算偏移
-        auto peak_idx = std::max_element(g_CurveY.begin(), g_CurveY.end()) - g_CurveY.begin();
-        double peak_value = g_CurveY[peak_idx];
-        size_t peak_offset = peak_idx + offset;
+        auto peak_idx = std::max_element(g_MonitorCurveY.begin(), g_MonitorCurveY.end()) - g_MonitorCurveY.begin();
+        double peak_value = g_MonitorCurveY[peak_idx];
+        size_t peak_offset = peak_idx;
         bool need_rescan = false;
         if (last_peak_value.has_value())
         {
-            //新旧峰值的大小相近，则认为是峰值的迁移
+            //新旧峰值的大小相近和距离，则认为是峰值的迁移
             if (peak_value > last_peak_value.value() * peak_threshold_min &&
-                peak_value < last_peak_value.value() * peak_threshold_max)
+                peak_value < last_peak_value.value() * peak_threshold_max &&
+                std::max(peak_offset, last_peak_offset.value()) - std::min(peak_offset, last_peak_offset.value()) < 2)
             {
-                set_offset_by_peak(peak_offset, offset);
+                set_offset_by_peak(peak_offset, u1.GetOffset());
             }
             //否则，重扫
             else
@@ -571,17 +793,21 @@ void DataThread(std::stop_token stoken, Uart0Reader& u0, Uart1Controller& u1)
         {
             if (!g_UseUserOffset || g_ShowAllBins)
             {
-                full_scan();
-                last_scan_time = std::chrono::high_resolution_clock::now();
+                if (!u1.Scanning())
+                {
+                    std::cout << "开始全局扫描\n";
+                    u1.RequestFullScan(process_fullscan_data, 1000ms);
+                    last_scan_time = std::chrono::high_resolution_clock::now();
+                }
             }
         }
 
         //手动指定偏移
         {
             std::lock_guard<std::mutex> lg(g_UserOffsetMutex);
-            if (g_UseUserOffset && u1.Offset() != g_UserOffset)
+            if (g_UseUserOffset && u1.GetOffset() != g_UserOffset)
             {
-                u1.CmdSetOffset(g_UserOffset);
+                u1.SetOffset(g_UserOffset);
             }
         }
 
@@ -622,16 +848,6 @@ int main()
     }
     auto& config = g_Config;
 
-    Uart0Reader reader(
-        config["uart0"].get<std::string>(), 
-        config["uart0-baudrate"].get<uint32_t>()
-	);
-    if (!reader.IsOpen())
-    {
-        std::cerr << "uart0 打开失败\n";
-        return -1;
-    }
-
     Uart1Controller controller(
         config["uart1"].get<std::string>(),
         config["uart1-baudrate"].get<uint32_t>()
@@ -642,7 +858,25 @@ int main()
         return -1;
     }
 
-    std::jthread data_thread(DataThread, std::ref(reader),std::ref(controller));
+    //controller.RequestFullScan([](const std::vector<ScanFrame>&) {
+    //    std::cout << "full scan over!\n";
+    //    }, 200ms);
+    //while (true)
+    //{
+    //    std::this_thread::sleep_for(100ms);
+    //}
+
+    Uart0Monitor monitor(
+        config["uart0"].get<std::string>(), 
+        config["uart0-baudrate"].get<uint32_t>()
+	);
+    if (!monitor.IsOpen())
+    {
+        std::cerr << "uart0 打开失败\n";
+        return -1;
+    }
+
+    std::jthread data_thread(DataThread, std::ref(monitor),std::ref(controller));
 
 	if (!ImGuiInit())
 	{
@@ -656,52 +890,40 @@ int main()
         ImGui::Begin((const char*)u8"距离曲线");
         {
             ImGui::Checkbox((const char*)u8"显示所有bin", &g_ShowAllBins);
-            if (g_ShowAllBins)
+            ImGui::Text((const char*)u8"当前偏移:%d", (int)controller.GetOffset());
+            ImGui::Checkbox((const char*)u8"手动指定偏移", &g_UseUserOffset);
             {
-                if (ImPlot::BeginPlot((const char*)u8"距离曲线", ImGui::GetWindowSize() - ImGui::GetCursorPos()))
-                {
-                    std::lock_guard<std::mutex> lg(g_GlobalCurveMutex);
-                    ImPlot::SetupAxes((const char*)u8"距离(cm)", (const char*)u8"信号强度");
-                    std::vector<double> curvex(g_GlobalCurveY.size());
-                    for (size_t i = 0; i < curvex.size(); i++)
-                    {
-                        curvex[i] = 5.0 * i;
-                    }
-                    auto max_energy = *std::max_element(g_GlobalCurveY.begin(), g_GlobalCurveY.end());
-                    auto min_energy = *std::min_element(g_GlobalCurveY.begin(), g_GlobalCurveY.end());
-                    ImPlot::SetupAxesLimits(0.0, 5.0 * g_Config["total-bin-count"].get<size_t>() + 5.0, 0.0, std::max(1000.0, max_energy) * 1.8);
-
-                    ImPlot::PushStyleVar(ImPlotStyleVar_FillAlpha, 0.25f);
-                    ImPlot::PlotShaded((const char*)u8"距离曲线", curvex.data(), g_GlobalCurveY.data(), curvex.size());
-                    ImPlot::PlotLine((const char*)u8"距离曲线", curvex.data(), g_GlobalCurveY.data(), curvex.size());
-                    ImPlot::PopStyleVar();
-                    ImPlot::EndPlot();
-                }
+                std::lock_guard<std::mutex> lg(g_UserOffsetMutex);
+                ImGui::SameLine();
+                static int p_step = 5;
+                ImGui::InputScalar((const char*)u8"偏移", ImGuiDataType_U16, &g_UserOffset, &p_step);
+                g_UserOffset = std::clamp(g_UserOffset, (uint16_t)0, (uint16_t)TOTAL_BIN_COUNT);
             }
-            else
+            if (ImPlot::BeginPlot((const char*)u8"距离曲线", ImGui::GetWindowSize() - ImGui::GetCursorPos()))
             {
-                ImGui::Text((const char*)u8"当前偏移:%d", (int)controller.Offset());
-                ImGui::Checkbox((const char*)u8"手动指定偏移", &g_UseUserOffset);
-                {
-                    std::lock_guard<std::mutex> lg(g_UserOffsetMutex);
-                    ImGui::SameLine();
-                    static int p_step = 5;
-                    ImGui::InputScalar((const char*)u8"偏移", ImGuiDataType_U16, &g_UserOffset, &p_step);
-                }
-                if (ImPlot::BeginPlot((const char*)u8"距离曲线", ImGui::GetWindowSize() - ImGui::GetCursorPos()))
                 {
                     std::lock_guard<std::mutex> lg(g_CurveMutex);
                     ImPlot::SetupAxes((const char*)u8"距离(cm)", (const char*)u8"信号强度");
-                    auto max_energy = *std::max_element(g_CurveY.begin(), g_CurveY.end());
-                    auto min_energy = *std::min_element(g_CurveY.begin(), g_CurveY.end());
-                    ImPlot::SetupAxesLimits(0.0, 5.0 * g_Config["total-bin-count"].get<size_t>() + 5.0, 0.0, std::max(1000.0, max_energy) * 1.8);
+                    auto max_energy = *std::max_element(g_MonitorCurveY.begin(), g_MonitorCurveY.end());
+                    auto min_energy = *std::min_element(g_MonitorCurveY.begin(), g_MonitorCurveY.end());
+                    ImPlot::SetupAxesLimits(0.0, 5.0 * TOTAL_BIN_COUNT + 5.0, 0.0, std::max(1000.0, max_energy) * 1.8);
 
                     ImPlot::PushStyleVar(ImPlotStyleVar_FillAlpha, 0.25f);
-                    ImPlot::PlotShaded((const char*)u8"距离曲线", g_CurveX.data(), g_CurveY.data(), SendBinCount);
-                    ImPlot::PlotLine((const char*)u8"距离曲线", g_CurveX.data(), g_CurveY.data(), SendBinCount);
+                    ImPlot::PlotShaded((const char*)u8"监测曲线", g_MonitorCurveX.data(), g_MonitorCurveY.data(), TOTAL_BIN_COUNT);
+                    ImPlot::PlotLine((const char*)u8"监测曲线", g_MonitorCurveX.data(), g_MonitorCurveY.data(), TOTAL_BIN_COUNT);
                     ImPlot::PopStyleVar();
-                    ImPlot::EndPlot();
                 }
+
+                if(g_ShowAllBins)
+                {
+                    std::lock_guard<std::mutex> lg(g_GlobalCurveMutex);
+                    ImPlot::PushStyleVar(ImPlotStyleVar_FillAlpha, 0.15f);
+                    ImPlot::PlotShaded((const char*)u8"全局曲线", g_MonitorCurveX.data(), g_GlobalCurveY.data(), TOTAL_BIN_COUNT);
+                    ImPlot::PlotLine((const char*)u8"全局曲线", g_MonitorCurveX.data(), g_GlobalCurveY.data(), TOTAL_BIN_COUNT);
+                    ImPlot::PopStyleVar();
+                }
+
+                ImPlot::EndPlot();
             }
         }
         ImGui::End();
